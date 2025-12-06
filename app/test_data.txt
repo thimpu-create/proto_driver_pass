@@ -1,0 +1,33 @@
+driver connect websocket:
+
+ws://localhost:8000/ws/driver/driver123
+message:
+    {
+        "lat": "26.219842", 
+        "lon": "91.807151"
+    }
+
+ws://localhost:8000/ws/driver/driver124
+message:
+    {
+        "lat": "26.165103", 
+        "lon": "91.861934"
+    }
+
+ws://localhost:8000/ws/driver/driver125
+message:
+    {
+        "lat": "26.219842", 
+        "lon": "91.807151"
+    }
+
+
+request ride :
+
+POST : http://localhost:8000/request_ride
+    data :
+        {
+        "passenger_id": "p1",
+        "lat": 26.174718,
+        "lon": 91.776698
+        }

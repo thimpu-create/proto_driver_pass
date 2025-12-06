@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Driver WebSocket</title>
+    <style>
+        body { font-family: Arial; padding: 20px; }
+        #log { background:#eee; padding:10px; height:250px; overflow:auto; }
+        button { margin: 10px 0; padding:10px 15px; }
+    </style>
+</head>
+<body>
+
+<h2>Driver Panel (driver124)</h2>
+
+<div id="status">Connecting...</div>
+
+<button id="acceptBtn" disabled>Accept Ride</button>
+<button id="completeBtn" disabled>Complete Ride</button>
+
+<h3>Logs</h3>
+<div id="log"></div>
+
+<script>
+const driverId = "driver124";
+const socket = new WebSocket(`ws://localhost:8000/ws/driver/${driverId}`);
+
+let lastRequestId = null;
+
+function log(msg) {
+    document.getElementById("log").innerHTML += msg + "<br>";
+}
+
+socket.onopen = () => {
+    document.getElementById("status").innerText = "Connected to Driver WS";
+    log("✅ WebSocket connected");
+};
+
+socket.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    log("📩 Received: " + JSON.stringify(data));
+
+    if (data.type === "ride_request") {
+        lastRequestId = data.request_id;
+        document.getElementById("acceptBtn").disabled = false;
+        log("🚗 New Ride Request → " + lastRequestId);
+    }
+
+    if (data.type === "ride_confirmed") {
+        document.getElementById("completeBtn").disabled = false;
+        log("✔ Ride confirmed with passenger " + data.passenger_id);
+    }
+
+    if (data.type === "ride_completed_ack") {
+        log("🏁 Ride completed successfully");
+    }
+};
+
+socket.onclose = () => log("❌ WebSocket closed");
+
+document.getElementById("acceptBtn").onclick = () => {
+    if (!lastRequestId) return;
+    log("➡ Sending accept_ride");
+    socket.send(JSON.stringify({
+        type: "accept_ride",
+        request_id: lastRequestId
+    }));
+};
+
+document.getElementById("completeBtn").onclick = () => {
+    if (!lastRequestId) return;
+    log("➡ Sending completed_ride");
+    socket.send(JSON.stringify({
+        type: "completed_ride",
+        request_id: lastRequestId
+    }));
+};
+</script>
+
+</body>
+</html>

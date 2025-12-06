@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Passenger WebSocket</title>
+    <style>
+        body { font-family: Arial; padding: 20px; }
+        #log { background:#eee; padding:10px; height:250px; overflow:auto; }
+        button { margin: 10px 0; padding:12px 20px; }
+    </style>
+</head>
+<body>
+
+<h2>Passenger Panel (p1)</h2>
+
+<div id="status">Connecting...</div>
+
+<button id="requestBtn">Request Ride</button>
+
+<h3>Logs</h3>
+<div id="log"></div>
+
+<script>
+const passengerId = "p1";
+const socket = new WebSocket(`ws://localhost:8000/ws/passenger/${passengerId}`);
+
+function log(msg) {
+    document.getElementById("log").innerHTML += msg + "<br>";
+}
+
+socket.onopen = () => {
+    document.getElementById("status").innerText = "Connected to Passenger WS";
+    log("✅ WebSocket connected");
+};
+
+socket.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    log("📩 Received: " + JSON.stringify(data));
+
+    if (data.type === "driver_assigned") {
+        log("🚗 Driver Assigned → " + data.driver_id);
+    }
+
+    if (data.type === "ride_completed") {
+        log("🏁 Driver completed the ride!");
+    }
+};
+
+socket.onclose = () => log("❌ WebSocket closed");
+
+document.getElementById("requestBtn").onclick = async () => {
+    log("➡ Sending ride request...");
+
+    const payload = {
+        passenger_id: passengerId,
+        lat: 26.174718,
+        lon: 91.776698
+    };
+
+    const res = await fetch("http://localhost:8000/request_ride", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload)
+    });
+
+    const data = await res.json();
+    log("📨 Response: " + JSON.stringify(data));
+};
+</script>
+
+</body>
+</html>

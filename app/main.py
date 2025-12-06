@@ -3,12 +3,40 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from redis_client import redis_conn
 import json
 from model import RideRequest
+from fastapi import APIRouter
+from fastapi.middleware.cors import CORSMiddleware
+
+router = APIRouter()
+
 app = FastAPI()
 
-# Store active WebSocket connections
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],           # GET, POST, OPTIONS, etc.
+    allow_headers=["*"],         # allow all origins
+)
+
 driver_connections = {}
 passenger_connections = {}
 
+
+# ---- Helpers ----
+def decode_val(v):
+    return v.decode() if isinstance(v, bytes) else v
+
+def decode_dict(d):
+    return {decode_val(k): decode_val(v) for k, v in d.items()}
+
+async def safe_send(ws, payload):
+    """Send JSON on a websocket but guard against exceptions so one bad client
+    does not kill the whole server."""
+    try:
+        await ws.send_json(payload)
+    except Exception as exc:
+        # Log and ignore
+        print("⚠️ Failed to send to websocket:", exc)
 
 # ------------------------
 # DRIVER WEBSOCKET
@@ -18,71 +46,118 @@ async def driver_ws(websocket: WebSocket, driver_id: str):
     await websocket.accept()
     driver_connections[driver_id] = websocket
 
-    # Mark the driver as available
     redis_conn.sadd("available_drivers", driver_id)
-
     print(f"Driver {driver_id} connected")
 
-    # --- Check if driver has an ongoing ride ---
+    # Check ongoing ride
     ride_key = f"ride:driver:{driver_id}"
     ride_data = redis_conn.hgetall(ride_key)
-
+    print("Raw ride data from Redis:", ride_data) 
     if ride_data:
-        # Send ongoing ride details to driver
-        await websocket.send_json({
-            "type": "ongoing_ride",
-            "passenger_id": ride_data.get("passenger_id"),
-            "pickup_lat": float(ride_data.get("pickup_lat")),
-            "pickup_lon": float(ride_data.get("pickup_lon")),
-            "status": ride_data.get("status", "assigned")
-        })
+        # Decode redis bytes safely
+        ride = decode_dict(ride_data)
 
-        print(f"Restored ride for driver {driver_id}")
+        # Extract fields
+        passenger_id = ride.get("passenger_id")
+        pickup_lat = ride.get("pickup_lat")
+        pickup_lon = ride.get("pickup_lon")
+        status = ride.get("status", "assigned")
+
+        # Validate mandatory fields
+        if passenger_id and pickup_lat is not None and pickup_lon is not None:
+            try:
+                await websocket.send_json({
+                    "type": "ongoing_ride",
+                    "passenger_id": passenger_id,
+                    "pickup_lat": float(pickup_lat),
+                    "pickup_lon": float(pickup_lon),
+                    "status": status
+                })
+                print(f"Restored ride for driver {driver_id}")
+
+            except ValueError:
+                print(f"⚠️ Invalid lat/lon stored for driver {driver_id}: {pickup_lat}, {pickup_lon}")
+                # Optional: cleanup bad redis data
+                # redis_conn.delete(ride_key)
+
+        else:
+            print(f"⚠️ Missing ride fields for driver {driver_id}: {ride}")
+            # Inform driver of partial/incomplete ride
+            await safe_send(websocket, {"type": "ride_error", "message": "Incomplete ride data."})
 
     try:
         while True:
             data = await websocket.receive_json()
-            # expecting: {"lat": 12.9, "lon": 77.6}
+            # ----- CHECK FOR RIDE ACCEPT FIRST -----
+            if data.get("type") == "accept_ride":
+                request_id = data.get("request_id")
+                print(f"Driver {driver_id} ACCEPTED ride {request_id}")
+                await handle_driver_accept(driver_id, request_id)
+                continue  # important
+            if data.get("type") == "completed_ride":
+                request_id = data.get("request_id")
+                ride_key = f"ride_request:{request_id}"
 
+                ride_data = redis_conn.hgetall(ride_key)
+                if not ride_data:
+                    await websocket.send_json({"type": "error", "message": "Ride not found"})
+                    continue
+
+                # Mark ride completed
+                redis_conn.hset(ride_key, "status", "completed")
+                print(f"Ride {request_id} completed by driver {driver_id}")
+
+                passenger_id = ride_data.get("passenger_id")
+
+                # Notify passenger
+                if passenger_id in passenger_connections:
+                    await passenger_connections[passenger_id].send_json({
+                        "type": "ride_completed",
+                        "request_id": request_id
+                    })
+
+                # Add driver back to available list
+                redis_conn.sadd("available_drivers", driver_id)
+                redis_conn.delete(ride_key)
+                redis_conn.delete(f"ride:driver:{driver_id}")
+                redis_conn.delete(f"ride:passenger:{passenger_id}")
+
+                # Confirm to driver
+                await websocket.send_json({
+                    "type": "ride_completed_ack",
+                    "request_id": request_id
+                })
+
+                continue
             lon = data.get("lon")
             lat = data.get("lat")
 
-            print("RAW DATA RECEIVED:", data)
-            print("LON:", lon, "LAT:", lat)
-
-            # Validate values
             if lon is None or lat is None:
-                print("❌ ERROR: Missing lat/lon in message:", data)
+                print("❌ Missing lat/lon:", data)
                 continue
 
             try:
                 lon = float(lon)
                 lat = float(lat)
-            except Exception as e:
-                print("❌ ERROR converting lat/lon to float:", e)
+            except:
+                print("❌ Invalid float:", data)
                 continue
 
-            print("GEOADD SENDING:", driver_id, lon, lat)
+            # GEO position update
+            redis_conn.geoadd("drivers_geo", [lon, lat, driver_id])
 
-            # UPDATE DRIVER GEO POSITION IN REDIS
-            redis_conn.geoadd(
-                "drivers_geo",
-                [lon, lat, driver_id]
-            )
-
-            # Update driver status + location
+            # Update driver info
             redis_conn.hset(
                 f"driver:{driver_id}",
-                mapping={
-                    "lat": lat,
-                    "lon": lon,
-                    "status": data.get("status", "available")
-                }
+                mapping={"lat": lat, "lon": lon, "status": data.get("status", "available")}
             )
 
     except WebSocketDisconnect:
         print(f"Driver {driver_id} disconnected")
-        redis_conn.srem("available_drivers", driver_id)
+        try:
+            redis_conn.srem("available_drivers", driver_id)
+        except Exception:
+            pass
         driver_connections.pop(driver_id, None)
 
 
@@ -95,35 +170,35 @@ async def passenger_ws(websocket: WebSocket, passenger_id: str):
     passenger_connections[passenger_id] = websocket
     print(f"Passenger {passenger_id} connected")
 
-    # 🔥 NEW: Check if passenger already has assigned ride in Redis
     ride_key = f"ride:passenger:{passenger_id}"
     ride_data = redis_conn.hgetall(ride_key)
 
     if ride_data:
-        # Convert bytes → str
-        ride = {k: v for k, v in ride_data.items()}
-
-        # Immediately send ongoing ride info
-        await websocket.send_json({
-            "type": "ongoing_ride",
-            "driver_id": ride["driver_id"],
-            "pickup_lat": float(ride["pickup_lat"]),
-            "pickup_lon": float(ride["pickup_lon"]),
-            "status": ride.get("status", "assigned")
-        })
-
-        print(f"Passenger {passenger_id} restored ride with driver {ride['driver_id']}")
-
-    # Normal WS receive loop
+        ride = decode_dict(ride_data)
+        driver_id = ride.get("driver_id")
+        pickup_lat = ride.get("pickup_lat")
+        pickup_lon = ride.get("pickup_lon")
+        status = ride.get("status", "assigned")
+                # Only send if sensible
+        if driver_id and pickup_lat is not None and pickup_lon is not None:
+            try:
+                await websocket.send_json({
+                    "type": "ongoing_ride",
+                    "driver_id": driver_id,
+                    "pickup_lat": float(pickup_lat),
+                    "pickup_lon": float(pickup_lon),
+                    "status": status
+                })
+            except ValueError:
+                print("⚠️ Invalid passenger ride lat/lon:", ride)
     try:
         while True:
-            data = await websocket.receive_text()
-            print(f"Passenger {passenger_id}: {data}")
+            msg = await websocket.receive_text()
+            print(f"Passenger {passenger_id}: {msg}")
 
     except WebSocketDisconnect:
         print(f"Passenger {passenger_id} disconnected")
-        del passenger_connections[passenger_id]
-
+        passenger_connections.pop(passenger_id, None)
 
 
 # ------------------------
@@ -133,109 +208,218 @@ async def passenger_ws(websocket: WebSocket, passenger_id: str):
 async def request_ride(data: RideRequest):
 
     passenger_id = data.passenger_id
-    lat = data.lat
-    lon = data.lon
+    lat, lon = data.lat, data.lon
 
-    # 1. Store passenger location in Redis
+    import uuid
+    request_id = str(uuid.uuid4())
+
     redis_conn.hset(
         f"passenger:{passenger_id}",
-        mapping={
-            "lat": lat,
-            "lon": lon,
-            "timestamp": time.time()
-        }
+        mapping={"lat": lat, "lon": lon, "timestamp": time.time()}
     )
 
-    # 2. Find the nearest available driver using GEO
-    nearby_drivers = redis_conn.georadius(
-        "drivers_geo",
-        lon,
-        lat,
-        10,          # search radius in km
-        unit="km",
-        withdist=True
+    # Nearest drivers
+    nearby = redis_conn.georadius("drivers_geo", lon, lat, 10, unit="km", withdist=True)
+
+    decoded = []
+    for raw_id, dist in nearby:
+        d_id = raw_id.decode() if isinstance(raw_id, bytes) else raw_id
+        decoded.append((d_id, dist))
+        print("Driver ->", d_id, "Distance ->", dist)
+
+    if not decoded:
+        return {"status": "no_drivers_available"}
+
+    # Store ride request
+    redis_conn.hset(
+        f"ride_request:{request_id}",
+        mapping={"passenger_id": passenger_id, "pickup_lat": lat, "pickup_lon": lon, "status": "pending"}
     )
 
-    print("🛰 Nearby drivers with distances:")
+    # Broadcast to drivers
+    for driver_id, dist in decoded:
+        if driver_id in driver_connections:
+            await driver_connections[driver_id].send_json({
+                "type": "ride_request",
+                "request_id": request_id,
+                "passenger_id": passenger_id,
+                "pickup_lat": lat,
+                "pickup_lon": lon
+            })
 
-    # Decode & print all
-    decoded_drivers = []
-    for raw_driver_id, dist in nearby_drivers:
-        d_id = raw_driver_id.decode() if isinstance(raw_driver_id, bytes) else raw_driver_id
-        decoded_drivers.append((d_id, dist))
-        print(f"   Driver: {d_id}, Distance: {dist} km")
-
-    if not decoded_drivers:
-        print("❌ No nearby drivers available")
-        return {"status": "no_drivers_available"}
-
-    # ✅ SORT THE DRIVERS BY DISTANCE
-    decoded_drivers.sort(key=lambda x: x[1])  # sort by distance ASC
-
-    # Select closest
-    driver_id, distance = decoded_drivers[0]
-    print(f"🏎 Closest driver (sorted): {driver_id}, distance={distance} km")
-
-    # Check availability
-    if not redis_conn.sismember("available_drivers", driver_id):
-        print("❌ Driver not available anymore:", driver_id)
-        return {"status": "no_drivers_available"}
-
-    # Remove from available pool
-    redis_conn.srem("available_drivers", driver_id)
-
-    # 3. Create a ride object (store in Redis)
-    ride_payload = {
-        "passenger_id": passenger_id,
-        "driver_id": driver_id,
-        "pickup_lat": lat,
-        "pickup_lon": lon,
-        "status": "assigned",
-        "timestamp": time.time()
-    }
-
-    redis_conn.hmset(f"ride:passenger:{passenger_id}", ride_payload)
-    redis_conn.hmset(f"ride:driver:{driver_id}", ride_payload)
-
-    # 4. Notify the driver via WebSocket
-    if driver_id in driver_connections:
-        await driver_connections[driver_id].send_json({
-            "type": "new_ride",
-            "passenger_id": passenger_id,
-            "pickup": {"lat": lat, "lon": lon}
-        })
-
-    # 5. Notify the passenger via WebSocket
-    if passenger_id in passenger_connections:
-        await passenger_connections[passenger_id].send_json({
-            "type": "driver_assigned",
-            "driver_id": driver_id,
-            "pickup_confirmed": True
-        })
-
-    return {
-        "status": "driver_assigned",
-        "driver_id": driver_id,
-        "pickup_lat": lat,
-        "pickup_lon": lon
-    }
+    return {"status": "request_sent", "request_id": request_id}
 
 
 # ------------------------
-# REDIS SUBSCRIBER (Background Task)
+# DRIVER ACCEPTS REQUEST
+# ------------------------
+async def handle_driver_accept(driver_id, request_id):
+    ride_key = f"ride_request:{request_id}"
+    ride_data = redis_conn.hgetall(ride_key)
+    print("Raw ride_request data:", ride_data)
+
+    if not ride_data:
+        ws = driver_connections.get(driver_id)
+        if ws:
+            await safe_send(ws, {"type": "ride_taken"})
+        return
+
+    ride = decode_dict(ride_data)
+
+    # Attempt atomic assign
+    lua = """
+    local k = KEYS[1]
+    local expected = ARGV[1]
+    local driver = ARGV[2]
+    local cur = redis.call('HGET', k, 'status')
+    if not cur then return -1 end
+    if cur ~= expected then return 0 end
+    redis.call('HSET', k, 'status', 'assigned')
+    redis.call('HSET', k, 'driver_id', driver)
+    return 1
+    """
+    res = redis_conn.eval(lua, 1, ride_key, "pending", driver_id)
+
+    if res == -1:
+        ws = driver_connections.get(driver_id)
+        if ws:
+            await safe_send(ws, {"type": "ride_taken"})
+        return
+
+    if res == 0:
+        ws = driver_connections.get(driver_id)
+        if ws:
+            await safe_send(ws, {"type": "ride_taken"})
+        return
+
+    # res == 1 -> success, proceed
+    passenger_id = ride.get("passenger_id")
+    try:
+        pickup_lat = float(ride.get("pickup_lat"))
+        pickup_lon = float(ride.get("pickup_lon"))
+    except Exception:
+        print("⚠️ Invalid pickup coords in ride_request:", ride)
+        ws = driver_connections.get(driver_id)
+        if ws:
+            await safe_send(ws, {"type": "ride_error", "message": "Invalid pickup coordinates."})
+        return
+
+    # Save driver-specific ongoing ride (for reconnect)
+    redis_conn.hset(f"ride:driver:{driver_id}", mapping={
+        "request_id": request_id,
+        "passenger_id": passenger_id,
+        "pickup_lat": pickup_lat,
+        "pickup_lon": pickup_lon,
+        "status": "assigned"
+    })
+    redis_conn.expire(f"ride:driver:{driver_id}", 3600)
+
+    # Save passenger side pointer
+    redis_conn.hset(f"ride:passenger:{passenger_id}", mapping={
+        "request_id": request_id,
+        "driver_id": driver_id,
+        "pickup_lat": pickup_lat,
+        "pickup_lon": pickup_lon,
+        "status": "assigned"
+    })
+    redis_conn.expire(f"ride:passenger:{passenger_id}", 3600)
+
+    # Optionally delete the ride_request key (since driver assigned)
+    # redis_conn.delete(ride_key)
+
+    # Notify passenger
+    pws = passenger_connections.get(passenger_id)
+    if pws:
+        await safe_send(pws, {
+            "type": "driver_assigned",
+            "driver_id": driver_id,
+            "pickup_lat": pickup_lat,
+            "pickup_lon": pickup_lon
+        })
+
+    # Confirm driver
+    dws = driver_connections.get(driver_id)
+    if dws:
+        await safe_send(dws, {
+            "type": "ride_confirmed",
+            "passenger_id": passenger_id,
+            "pickup_lat": pickup_lat,
+            "pickup_lon": pickup_lon
+        })
+
+    # Remove driver from available set
+    try:
+        redis_conn.srem("available_drivers", driver_id)
+    except Exception:
+        pass
+
+    # Notify other drivers
+    for d_id, ws in list(driver_connections.items()):
+        if d_id != driver_id:
+            await safe_send(ws, {"type": "ride_taken", "request_id": request_id})
+
+    print(f"Ride {request_id} assigned to driver {driver_id}")
+
+
+
+# ------------------------
+# REDIS SUBSCRIBER
 # ------------------------
 @app.on_event("startup")
 async def redis_subscribe():
     import threading
 
     def listen():
-        pubsub = redis_conn.pubsub()
-        pubsub.subscribe("ride_channel")
-        print("Subscribed to Redis queue...")
+        pub = redis_conn.pubsub()
+        pub.subscribe("ride_channel")
+        print("Subscribed to Redis...")
+        for msg in pub.listen():
+            if msg["type"] == "message":
+                print("QUEUE →", msg["data"])
 
-        for message in pubsub.listen():
-            if message["type"] == "message":
-                print("QUEUE EVENT:", message["data"])
+    threading.Thread(target=listen, daemon=True).start()
 
-    thread = threading.Thread(target=listen)
-    thread.start()
+
+
+# List all important Redis keys
+@router.get("/admin/keys")
+def list_keys():
+    keys = redis_conn.keys("*")
+    decoded = [k.decode() for k in keys]
+    return {"keys": decoded}
+
+# Get value of any key
+@router.get("/admin/key/{key_name}")
+def get_key(key_name: str):
+    try:
+        key = key_name
+        if key.encode() not in redis_conn.keys("*"):
+            return {"error": "Key not found"}
+
+        type_ = redis_conn.type(key).decode()
+
+        if type_ == "string":
+            return {"type": "string", "value": redis_conn.get(key).decode()}
+
+        if type_ == "hash":
+            return {
+                "type": "hash",
+                "value": {k.decode(): v.decode() for k, v in redis_conn.hgetall(key).items()}
+            }
+
+        if type_ == "set":
+            return {
+                "type": "set",
+                "value": [v.decode() for v in redis_conn.smembers(key)]
+            }
+
+        if type_ == "zset":
+            z = redis_conn.zrange(key, 0, -1, withscores=True)
+            return {"type": "zset", "value": [(i.decode(), s) for i, s in z]}
+
+        return {"type": type_, "value": "Not supported yet"}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+app.include_router(router, prefix="/admin")
