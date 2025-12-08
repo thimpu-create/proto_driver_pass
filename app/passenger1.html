@@ -2,11 +2,25 @@
 <html>
 <head>
     <title>Passenger WebSocket</title>
+
     <style>
         body { font-family: Arial; padding: 20px; }
-        #log { background:#eee; padding:10px; height:250px; overflow:auto; }
+        #log { background:#eee; padding:10px; height:150px; overflow:auto; margin-bottom: 15px; }
         button { margin: 10px 0; padding:12px 20px; }
+
+        /* Map Styling */
+        #map {
+            height: 350px;
+            width: 100%;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            margin-top: 10px;
+        }
     </style>
+
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+
 </head>
 <body>
 
@@ -19,14 +33,54 @@
 <h3>Logs</h3>
 <div id="log"></div>
 
+<h3>Driver Live Location</h3>
+<div id="map">Loading map...</div>
+
+<!-- Leaflet JS -->
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
 <script>
 const passengerId = "p1";
 const socket = new WebSocket(`ws://localhost:8000/ws/passenger/${passengerId}`);
 
+let map;
+let driverMarker = null;
+
+// ---------------------------------------
+// LOG HELPER
+// ---------------------------------------
 function log(msg) {
     document.getElementById("log").innerHTML += msg + "<br>";
 }
 
+// ---------------------------------------
+// INIT MAP
+// ---------------------------------------
+function initMap() {
+    map = L.map('map').setView([26.1747, 91.7767], 14);
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19
+    }).addTo(map);
+}
+
+initMap();  // initialize on page load
+
+// ---------------------------------------
+// UPDATE DRIVER MARKER
+// ---------------------------------------
+function moveDriver(lat, lon) {
+    if (!driverMarker) {
+        driverMarker = L.marker([lat, lon]).addTo(map);
+    } else {
+        driverMarker.setLatLng([lat, lon]);
+    }
+    map.panTo([lat, lon]);
+}
+
+// ---------------------------------------
+// WEBSOCKET EVENTS
+// ---------------------------------------
 socket.onopen = () => {
     document.getElementById("status").innerText = "Connected to Passenger WS";
     log("✅ WebSocket connected");
@@ -36,17 +90,33 @@ socket.onmessage = (event) => {
     const data = JSON.parse(event.data);
     log("📩 Received: " + JSON.stringify(data));
 
+    // Driver Assigned
     if (data.type === "driver_assigned") {
         log("🚗 Driver Assigned → " + data.driver_id);
     }
 
+    // Ongoing ride restore (FastAPI sends this on reconnect)
+    if (data.type === "ongoing_ride") {
+        log("♻ Restored ongoing ride");
+    }
+
+    // LIVE DRIVER MOVEMENT → update map
+    if (data.type === "driver_location_update") {
+        moveDriver(data.lat, data.lon);
+    }
+
+    // Ride completed
     if (data.type === "ride_completed") {
         log("🏁 Driver completed the ride!");
+        driverMarker = null;   // reset
     }
 };
 
 socket.onclose = () => log("❌ WebSocket closed");
 
+// ---------------------------------------
+// SEND RIDE REQUEST
+// ---------------------------------------
 document.getElementById("requestBtn").onclick = async () => {
     log("➡ Sending ride request...");
 

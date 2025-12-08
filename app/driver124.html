@@ -3,9 +3,39 @@
 <head>
     <title>Driver WebSocket</title>
     <style>
-        body { font-family: Arial; padding: 20px; }
-        #log { background:#eee; padding:10px; height:250px; overflow:auto; }
-        button { margin: 10px 0; padding:10px 15px; }
+        body {
+            font-family: Arial;
+            padding: 20px;
+            background: #fafafa;
+        }
+        #log {
+            background: #f5f5f5;
+            padding: 10px;
+            height: 250px;
+            overflow-y: auto;
+            border-radius: 6px;
+            border: 1px solid #ddd;
+        }
+        .request-box, .current-ride-box {
+            padding: 12px;
+            background: #fff;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            margin-bottom: 10px;
+        }
+        button {
+            margin: 5px 0;
+            padding: 7px 14px;
+            border-radius: 5px;
+            border: none;
+            background: #007bff;
+            color: white;
+            cursor: pointer;
+        }
+        button:disabled {
+            background: #999;
+            cursor: not-allowed;
+        }
     </style>
 </head>
 <body>
@@ -14,7 +44,13 @@
 
 <div id="status">Connecting...</div>
 
-<button id="acceptBtn" disabled>Accept Ride</button>
+<h3>Incoming Ride Requests</h3>
+<div id="requests"></div>
+
+<h3>Current Ride</h3>
+<div id="currentRide"></div>
+
+<button id="updateLocationBtn">Update Location (Random)</button>
 <button id="completeBtn" disabled>Complete Ride</button>
 
 <h3>Logs</h3>
@@ -24,12 +60,33 @@
 const driverId = "driver124";
 const socket = new WebSocket(`ws://localhost:8000/ws/driver/${driverId}`);
 
-let lastRequestId = null;
+let activeRequestId = null;
 
+// -------------------------------------------------------------
+// HELPERS
+// -------------------------------------------------------------
 function log(msg) {
-    document.getElementById("log").innerHTML += msg + "<br>";
+    const logDiv = document.getElementById("log");
+    logDiv.innerHTML += msg + "<br>";
+    logDiv.scrollTop = logDiv.scrollHeight;
 }
 
+function setCurrentRide(data) {
+    activeRequestId = data.request_id;
+    document.getElementById("completeBtn").disabled = false;
+
+    document.getElementById("currentRide").innerHTML = `
+        <div class="current-ride-box">
+            <strong>Passenger:</strong> ${data.passenger_id}<br>
+            <strong>Pickup:</strong> (${data.pickup_lat}, ${data.pickup_lon})<br>
+            <strong>Request ID:</strong> ${data.request_id}
+        </div>
+    `;
+}
+
+// -------------------------------------------------------------
+// WEBSOCKET EVENTS
+// -------------------------------------------------------------
 socket.onopen = () => {
     document.getElementById("status").innerText = "Connected to Driver WS";
     log("✅ WebSocket connected");
@@ -39,39 +96,98 @@ socket.onmessage = (event) => {
     const data = JSON.parse(event.data);
     log("📩 Received: " + JSON.stringify(data));
 
-    if (data.type === "ride_request") {
-        lastRequestId = data.request_id;
-        document.getElementById("acceptBtn").disabled = false;
-        log("🚗 New Ride Request → " + lastRequestId);
-    }
+    switch (data.type) {
+        case "ride_request":
+            addRideRequestToUI(data);
+            break;
 
-    if (data.type === "ride_confirmed") {
-        document.getElementById("completeBtn").disabled = false;
-        log("✔ Ride confirmed with passenger " + data.passenger_id);
-    }
+        case "ride_confirmed":
+            log("✔ Ride confirmed with passenger " + data.passenger_id);
+            setCurrentRide(data);
+            break;
 
-    if (data.type === "ride_completed_ack") {
-        log("🏁 Ride completed successfully");
+        case "ongoing_ride":
+            log("🚕 Restored ongoing ride for passenger " + data.passenger_id);
+            setCurrentRide(data);
+            break;
+
+        case "ride_completed_ack":
+            log("🏁 Ride completed successfully");
+            break;
+
+        case "ride_taken":
+            removeRideRequestFromUI(data.request_id);
+            log("❌ Ride taken by another driver. Removed from UI.");
+            break;
     }
 };
 
 socket.onclose = () => log("❌ WebSocket closed");
 
-document.getElementById("acceptBtn").onclick = () => {
-    if (!lastRequestId) return;
-    log("➡ Sending accept_ride");
+// -------------------------------------------------------------
+// UI HANDLERS
+// -------------------------------------------------------------
+function removeRideRequestFromUI(requestId) {
+    const el = document.getElementById("req_" + requestId);
+    if (el) el.remove();
+}
+
+function addRideRequestToUI(data) {
+    const reqContainer = document.getElementById("requests");
+
+    const box = document.createElement("div");
+    box.className = "request-box";
+    box.id = "req_" + data.request_id;
+
+    box.innerHTML = `
+        <strong>Ride Request</strong><br>
+        Passenger: ${data.passenger_id}<br>
+        Pickup: (${data.pickup_lat}, ${data.pickup_lon})<br><br>
+        <button onclick="acceptRide('${data.request_id}')">Accept Ride</button>
+    `;
+
+    reqContainer.appendChild(box);
+}
+
+function acceptRide(requestId) {
+    log("➡ Accepting ride: " + requestId);
+
     socket.send(JSON.stringify({
         type: "accept_ride",
-        request_id: lastRequestId
+        request_id: requestId
     }));
+
+    document.getElementById("requests").innerHTML = "";
+}
+
+// -------------------------------------------------------------
+// 📡 UPDATE LOCATION BUTTON
+// -------------------------------------------------------------
+document.getElementById("updateLocationBtn").onclick = () => {
+    const lat = (26.10 + Math.random() * 0.1).toFixed(6);
+    const lon = (91.70 + Math.random() * 0.1).toFixed(6);
+
+    const payload = {
+        lat: parseFloat(lat),
+        lon: parseFloat(lon)
+    };
+
+    log("📡 Sending location: " + JSON.stringify(payload));
+
+    socket.send(JSON.stringify(payload));
 };
 
+// -------------------------------------------------------------
+// COMPLETE RIDE
+// -------------------------------------------------------------
 document.getElementById("completeBtn").onclick = () => {
-    if (!lastRequestId) return;
+    if (!activeRequestId) return;
+
     log("➡ Sending completed_ride");
+
     socket.send(JSON.stringify({
         type: "completed_ride",
-        request_id: lastRequestId
+        request_id: activeRequestId
     }));
 };
 </script>

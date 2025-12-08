@@ -5,10 +5,33 @@ import json
 from model import RideRequest
 from fastapi import APIRouter
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+import threading
 
 router = APIRouter()
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    def listen():
+        pub = redis_conn.pubsub()
+        pub.subscribe("ride_channel")
+        print("Subscribed to Redis...")
+        for msg in pub.listen():
+            if msg["type"] == "message":
+                print("QUEUE →", msg["data"])
+
+    # Start pubsub listener
+    t = threading.Thread(target=listen, daemon=True)
+    t.start()
+
+    yield   # app is running
+
+    print("Stopping app... (Redis subscriber thread will auto-exit)")
+
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -61,6 +84,7 @@ async def driver_ws(websocket: WebSocket, driver_id: str):
         passenger_id = ride.get("passenger_id")
         pickup_lat = ride.get("pickup_lat")
         pickup_lon = ride.get("pickup_lon")
+        request_id = ride.get("request_id")
         status = ride.get("status", "assigned")
 
         # Validate mandatory fields
@@ -71,6 +95,7 @@ async def driver_ws(websocket: WebSocket, driver_id: str):
                     "passenger_id": passenger_id,
                     "pickup_lat": float(pickup_lat),
                     "pickup_lon": float(pickup_lon),
+                    "request_id": request_id,
                     "status": status
                 })
                 print(f"Restored ride for driver {driver_id}")
@@ -151,6 +176,25 @@ async def driver_ws(websocket: WebSocket, driver_id: str):
                 f"driver:{driver_id}",
                 mapping={"lat": lat, "lon": lon, "status": data.get("status", "available")}
             )
+            # ---------------------------------------------
+            # 🚀 NEW: Check if driver is in a ride
+            # ---------------------------------------------
+            passenger_id = redis_conn.hget(f"ride:driver:{driver_id}", "passenger_id")
+
+            if passenger_id:
+                passenger_id = passenger_id
+
+                # Only send if passenger is connected
+                passenger_ws = passenger_connections.get(passenger_id)
+
+                if passenger_ws:
+                    await passenger_ws.send_json({
+                        "type": "driver_location_update",
+                        "driver_id": driver_id,
+                        "lat": lat,
+                        "lon": lon
+                    })
+                    print(f"📡 Sent driver location to passenger {passenger_id}")
 
     except WebSocketDisconnect:
         print(f"Driver {driver_id} disconnected")
@@ -210,7 +254,54 @@ async def request_ride(data: RideRequest):
     passenger_id = data.passenger_id
     lat, lon = data.lat, data.lon
 
-    import uuid
+    # ----------------------------------------------------
+    # 1) Check if passenger already has an active ride
+    # ----------------------------------------------------
+    existing_ride = redis_conn.get(f"ride:passenger:{passenger_id}")
+    if existing_ride:
+        return {
+            "status": "already_in_ride",
+            "ride_id": existing_ride.decode() if isinstance(existing_ride, bytes) else existing_ride
+        }
+
+    # ----------------------------------------------------
+    # 2) Check if passenger already has a pending request
+    # ----------------------------------------------------
+    # Search keys like: ride_request:*  where passenger_id matches
+    for key in redis_conn.scan_iter("ride_request:*"):
+
+        print("\n🔍 Checking key:", key)
+
+        ride_info = redis_conn.hgetall(key)
+        print("👉 Raw ride_info:", ride_info)
+
+        if ride_info:
+            try:
+                pid = ride_info.get("passenger_id", "")
+                status = ride_info.get("status", "")
+            except Exception as e:
+                print("❌ Decode error:", e)
+                continue
+
+            print("➡ passenger_id in record:", pid)
+            print("➡ status in record:", status)
+            print("➡ current passenger_id:", passenger_id)
+
+            # FINAL MATCH CHECK
+            if pid == passenger_id and status == "pending":
+                print("✅ MATCH FOUND -> Passenger already has a pending ride")
+                return {
+                    "status": "already_requested",
+                    "request_id": key.split(":", 1)[1]
+                }
+
+        else:
+            print("⚠ ride_info is empty for key:", key)
+
+    # ----------------------------------------------------
+    # Continue normal flow...
+    # ----------------------------------------------------
+    import uuid, time
     request_id = str(uuid.uuid4())
 
     redis_conn.hset(
@@ -218,25 +309,26 @@ async def request_ride(data: RideRequest):
         mapping={"lat": lat, "lon": lon, "timestamp": time.time()}
     )
 
-    # Nearest drivers
     nearby = redis_conn.georadius("drivers_geo", lon, lat, 10, unit="km", withdist=True)
 
     decoded = []
     for raw_id, dist in nearby:
         d_id = raw_id.decode() if isinstance(raw_id, bytes) else raw_id
         decoded.append((d_id, dist))
-        print("Driver ->", d_id, "Distance ->", dist)
 
     if not decoded:
         return {"status": "no_drivers_available"}
 
-    # Store ride request
     redis_conn.hset(
         f"ride_request:{request_id}",
-        mapping={"passenger_id": passenger_id, "pickup_lat": lat, "pickup_lon": lon, "status": "pending"}
+        mapping={
+            "passenger_id": passenger_id,
+            "pickup_lat": lat,
+            "pickup_lon": lon,
+            "status": "pending"
+        }
     )
 
-    # Broadcast to drivers
     for driver_id, dist in decoded:
         if driver_id in driver_connections:
             await driver_connections[driver_id].send_json({
@@ -344,7 +436,8 @@ async def handle_driver_accept(driver_id, request_id):
             "type": "ride_confirmed",
             "passenger_id": passenger_id,
             "pickup_lat": pickup_lat,
-            "pickup_lon": pickup_lon
+            "pickup_lon": pickup_lon,
+            "request_id": request_id
         })
 
     # Remove driver from available set
@@ -355,29 +448,23 @@ async def handle_driver_accept(driver_id, request_id):
 
     # Notify other drivers
     for d_id, ws in list(driver_connections.items()):
-        if d_id != driver_id:
-            await safe_send(ws, {"type": "ride_taken", "request_id": request_id})
+        if d_id == driver_id:
+            continue  # skip driver who just accepted
 
-    print(f"Ride {request_id} assigned to driver {driver_id}")
+        # Check if driver has an ongoing ride
+        ongoing_ride = redis_conn.exists(f"ride:driver:{d_id}")  # returns 0 or 1
+
+        # Check driver status
+        d_status = redis_conn.hget(f"driver:{d_id}", "status")
+        d_status = d_status or "available"
+
+        if d_status != "available" or ongoing_ride:
+            print(f"Skipping busy driver {d_id} (status={d_status}, ongoing={ongoing_ride})")
+            continue  # skip busy drivers
+
+        await safe_send(ws, {"type": "ride_taken", "request_id": request_id})
 
 
-
-# ------------------------
-# REDIS SUBSCRIBER
-# ------------------------
-@app.on_event("startup")
-async def redis_subscribe():
-    import threading
-
-    def listen():
-        pub = redis_conn.pubsub()
-        pub.subscribe("ride_channel")
-        print("Subscribed to Redis...")
-        for msg in pub.listen():
-            if msg["type"] == "message":
-                print("QUEUE →", msg["data"])
-
-    threading.Thread(target=listen, daemon=True).start()
 
 
 
